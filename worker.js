@@ -135,12 +135,15 @@ async function obfuscate(content, debug = () => {}) {
     debug('Obfuscate API content-type:', contentType);
     debug('Obfuscate API raw response:', raw);
 
-    if (!res.ok || !contentType.includes('application/json')) {
-      debug('Obfuscate API returned error or invalid content-type');
+    let data;
+    try {
+      data = JSON.parse(raw);
+      debug('Parsed obfuscate response:', JSON.stringify(data, null, 2));
+    } catch (e) {
+      debug('JSON parse error in obfuscate:', e.message);
       return content;
     }
 
-    const data = JSON.parse(raw);
     debug('Obfuscated result:', data.obfuscated);
     return data.obfuscated || content;
   } catch (e) {
@@ -251,6 +254,20 @@ function renderHTML(notes, sortOrder = 'desc', debugLogs = []) {
 
 function isRobloxScript(content) {
   const lc = content.toLowerCase();
-  const keywords = ['game:', 'workspace', 'instance.new', 'vector3', 'cframe', 'players', 'localplayer', 'script', 'function'];
+  const keywords = [
+    'game',
+    'workspace',
+    'instance.new',
+    'vector3',
+    'cframe',
+    'players',
+    'localplayer',
+    'script',
+    'function',
+    'getservice',
+    'mouse',
+    'humanoid',
+    'tool'
+  ];
   return keywords.some(keyword => lc.includes(keyword));
 }

@@ -49,6 +49,8 @@ export default {
           debug('Detected Roblox script, obfuscating...');
           content = await obfuscate(content, debug);
           debug('Final obfuscated content:', content);
+        } else {
+          debug('Not a Roblox script, skipping obfuscation.');
         }
 
         const id = crypto.randomUUID();
@@ -144,7 +146,10 @@ async function obfuscate(content, debug = () => {}) {
       return content;
     }
 
-    debug('Obfuscated result:', data.obfuscated);
+    if (!data.obfuscated) {
+      debug('No obfuscated content returned. Using original.');
+    }
+
     return data.obfuscated || content;
   } catch (e) {
     debug('obfuscate error:', e.message);
@@ -255,19 +260,10 @@ function renderHTML(notes, sortOrder = 'desc', debugLogs = []) {
 function isRobloxScript(content) {
   const lc = content.toLowerCase();
   const keywords = [
-    'game',
-    'workspace',
-    'instance.new',
-    'vector3',
-    'cframe',
-    'players',
-    'localplayer',
-    'script',
-    'function',
-    'getservice',
-    'mouse',
-    'humanoid',
-    'tool'
+    'game', 'workspace', 'instance.new', 'vector3', 'cframe', 'players',
+    'localplayer', 'script', 'function', 'getservice', 'mouse',
+    'humanoid', 'tool', 'wait(', 'while', 'for', 'spawn', 'pcall'
   ];
+
   return keywords.some(keyword => lc.includes(keyword));
 }

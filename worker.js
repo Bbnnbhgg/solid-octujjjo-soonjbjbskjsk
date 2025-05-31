@@ -1,225 +1,357 @@
+// index.js
+
 export default {
-  async fetch(req, env, ctx) {
-    const logs = [];
-    function debug(...args) {
-      logs.push(args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' '));
-    }
-
+  // Entry point for all incoming requests
+  async fetch(request, env) {
     try {
-      debug('Fetch event started', req.method, req.url);
+      const url = new URL(request.url);
+      const pathname = url.pathname;
 
-      const url = new URL(req.url);
-      const { pathname, searchParams } = url;
-
-      debug('Pathname:', pathname);
-
-      if (req.method === 'GET' && pathname === '/') {
-        debug('Handling GET /');
-        const notes = await listNotesFromGithub(env); // debug removed here
-        const html = renderHTML(notes, searchParams.get('sort') || 'desc', logs);
-        return new Response(html, { headers: { 'Content-Type': 'text/html' } });
+      if (request.method === 'GET' && pathname === '/') {
+        return await handleGetRoot(request, env);
       }
 
-      if (req.method === 'POST' && pathname === '/notes') {
-        debug('Handling POST /notes');
-        const formData = await req.formData();
-        const password = formData.get('password');
-
-        if (password !== env.NOTE_PASSWORD) {
-          debug('Unauthorized: wrong password');
-          return new Response('Unauthorized', { status: 401 });
-        }
-
-        let title = formData.get('title') || 'Untitled';
-        let content = formData.get('content');
-
-        if (!content) {
-          debug('Bad request: content missing');
-          return new Response('Content is required', { status: 400 });
-        }
-
-        try {
-          title = await filterText(title, debug);
-          content = await filterText(content, debug);
-        } catch (e) {
-          debug('Filter failed, using raw inputs.', e.message);
-        }
-
-        debug('Obfuscating content...');
-        content = await obfuscate(content, debug);
-        debug('Final obfuscated content:', content);
-
-        const id = crypto.randomUUID();
-        debug('Generated note ID:', id);
-
-        await storeNoteGithub(id, title, content, env, debug);
-        debug('Stored note to GitHub');
-        return Response.redirect(req.url.replace(/\/notes$/, '/'), 302);
+      if (request.method === 'POST' && pathname === '/notes') {
+        return await handlePostNotes(request, env);
       }
 
-      if (req.method === 'GET' && pathname.startsWith('/notes/')) {
-        const id = pathname.split('/notes/')[1];
-        const ua = req.headers.get('user-agent') || '';
-        if (!ua.includes('Roblox')) {
-          debug('Access denied: user-agent check failed');
-          return new Response('Access denied', { status: 403 });
-        }
-
-        const notes = await listNotesFromGithub(env); // debug removed here
-        const note = notes.find(n => n.id === id);
-        if (!note) {
-          debug('Note not found:', id);
-          return new Response('Not found', { status: 404 });
-        }
-
-        debug('Serving note:', id);
-        return new Response(note.content, { headers: { 'Content-Type': 'text/plain' } });
+      if (request.method === 'GET' && pathname.startsWith('/notes/')) {
+        // Extract the note ID from the path
+        const id = pathname.split('/').pop();
+        return await handleGetNoteById(request, env, id);
       }
 
-      debug('Route not found');
-      return new Response('Not found', { status: 404 });
+      return new Response('Not Found', { status: 404 });
     } catch (err) {
-      debug('Unhandled error:', err.message);
+      // In case anything goes wrong:
       return new Response(
-        `Internal Server Error\n\nDebug logs:\n${logs.join('\n')}\n\nError: ${err.stack}`,
-        { status: 500, headers: { 'Content-Type': 'text/plain' } }
+        `Internal Server Error\n\n${err.stack || err.message}`,
+        {
+          status: 500,
+          headers: { 'Content-Type': 'text/plain' },
+        }
       );
     }
-  }
+  },
 };
 
-async function filterText(text, debug = () => {}) {
+// -------------------- Handlers --------------------
+
+/**
+ * GET /
+ * List notes (by reading from GitHub) and render HTML form + list.
+ */
+async function handleGetRoot(request, env) {
+  const sortOrder = new URL(request.url).searchParams.get('sort') || 'desc';
   try {
-    debug('Calling filter API with text:', text);
-    const res = await fetch('https://tiny-river-0235.hiplitehehe.workers.dev/', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text })
+    const notes = await listNotesFromGithub(env);
+    const html = renderHTML(notes, sortOrder);
+    return new Response(html, {
+      headers: { 'Content-Type': 'text/html' },
     });
+  } catch (err) {
+    return new Response(
+      `Failed to list notes:\n\n${err.stack || err.message}`,
+      { status: 500, headers: { 'Content-Type': 'text/plain' } }
+    );
+  }
+}
 
-    debug('Filter API response status:', res.status);
-    const contentType = res.headers.get('content-type') || '';
-    const raw = await res.text();
+/**
+ * POST /notes
+ * - Parses JSON or x-www-form-urlencoded body
+ * - Checks password
+ * - Runs filterText → obfuscate
+ * - Generates a UUID
+ * - Stores the note in GitHub under notes/{uuid}.txt
+ * - Redirects back to GET /
+ */
+async function handlePostNotes(request, env) {
+  // 1) Parse the request body as either JSON or urlencoded
+  let fields = {};
+  const contentType = (request.headers.get('Content-Type') || '').toLowerCase();
 
-    debug('Filter API content-type:', contentType);
-    debug('Filter API raw response:', raw);
+  if (contentType.includes('application/json')) {
+    try {
+      fields = await request.json();
+    } catch {
+      return new Response('Bad Request: Invalid JSON', { status: 400 });
+    }
+  } else if (contentType.includes('application/x-www-form-urlencoded')) {
+    const text = await request.text();
+    fields = Object.fromEntries(new URLSearchParams(text));
+  } else {
+    return new Response('Unsupported Media Type', { status: 415 });
+  }
 
-    if (!res.ok || !contentType.includes('application/json')) {
-      debug('Filter API returned error or invalid content-type');
-      return text;
+  const rawPassword = fields.password || '';
+  const rawTitle = fields.title || '';
+  const rawContent = fields.content || '';
+
+  // 2) Check the password
+  if (rawPassword !== env.NOTE_PASSWORD) {
+    return new Response('Unauthorized', { status: 401 });
+  }
+
+  // 3) Ensure content exists
+  if (!rawContent.trim()) {
+    return new Response('Content is required', { status: 400 });
+  }
+
+  // 4) Filter title & content (if filtering fails, use the raw strings)
+  let title = rawTitle.trim() || 'Untitled';
+  let content = rawContent;
+
+  try {
+    title = await filterText(title);
+  } catch {
+    // on error, keep raw title
+  }
+
+  try {
+    content = await filterText(content);
+  } catch {
+    // on error, keep raw content
+  }
+
+  // 5) Obfuscate
+  try {
+    content = await obfuscate(content);
+  } catch {
+    // on error, keep filtered (or raw) content
+  }
+
+  // 6) Generate a UUID for this note
+  const id = crypto.randomUUID();
+
+  // 7) Store it in GitHub
+  try {
+    await storeNoteGithub(id, title, content, env);
+  } catch (err) {
+    return new Response(
+      `Failed to store note:\n\n${err.stack || err.message}`,
+      { status: 500, headers: { 'Content-Type': 'text/plain' } }
+    );
+  }
+
+  // 8) Redirect back to GET /
+  // Use 303 to indicate “See Other” after POST
+  return Response.redirect(new URL('/', request.url), 303);
+}
+
+/**
+ * GET /notes/:id
+ * - Checks User-Agent contains "Roblox"
+ * - Fetches all notes from GitHub, finds the one with matching id
+ * - Returns its plain‐text content
+ */
+async function handleGetNoteById(request, env, id) {
+  const ua = request.headers.get('User-Agent') || '';
+  if (!ua.includes('Roblox')) {
+    return new Response('Access denied', { status: 403 });
+  }
+
+  try {
+    const notes = await listNotesFromGithub(env);
+    const note = notes.find((n) => n.id === id);
+    if (!note) {
+      return new Response('Not found', { status: 404 });
     }
 
-    const data = JSON.parse(raw);
-    return data.filtered || text;
-  } catch (e) {
-    debug('filterText error:', e.message);
+    return new Response(note.content, {
+      headers: { 'Content-Type': 'text/plain' },
+    });
+  } catch (err) {
+    return new Response(
+      `Failed to fetch note:\n\n${err.stack || err.message}`,
+      { status: 500, headers: { 'Content-Type': 'text/plain' } }
+    );
+  }
+}
+
+// -------------------- Utility Functions --------------------
+
+/**
+ * filterText(text)
+ * --------------------------------------
+ * Sends `{ text }` to the external filter API.
+ * If the API returns `{ filtered: '...' }` then use that, otherwise return the original text.
+ * Any errors or non-200 responses → return the original text.
+ */
+async function filterText(text) {
+  const payload = JSON.stringify({ text });
+  let res;
+  try {
+    res = await fetch('https://tiny-river-0235.hiplitehehe.workers.dev/', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: payload,
+    });
+  } catch {
+    // network error → return raw
     return text;
   }
+
+  if (!res.ok) {
+    // non-200 → return raw
+    return text;
+  }
+
+  const contentType = (res.headers.get('Content-Type') || '').toLowerCase();
+  if (!contentType.includes('application/json')) {
+    // unexpected response type → return raw
+    return text;
+  }
+
+  let data;
+  try {
+    data = await res.json();
+  } catch {
+    return text;
+  }
+
+  if (data.filtered && typeof data.filtered === 'string') {
+    return data.filtered;
+  }
+
+  // If the API indicates “clean” or no `filtered` field, return original
+  return text;
 }
 
-async function obfuscate(content, debug = () => {}) {
+/**
+ * obfuscate(content)
+ * --------------------------------------
+ * Sends `{ script: content }` to the obfuscation API.
+ * If the API returns `{ obfuscated: '...' }` then use that, otherwise return original content.
+ */
+async function obfuscate(content) {
+  const payload = JSON.stringify({ script: content });
+  let res;
   try {
-    debug('Calling obfuscate API with content:', content);
-
-    const payload = JSON.stringify({ script: content });
-    debug('Obfuscate API payload:', payload);
-
-    const url = 'https://broken-pine-ac7f.hiplitehehe.workers.dev/api/obfuscate';
-    debug('Obfuscate API URL:', url);
-
-    const res = await fetch(url, {
+    res = await fetch('https://broken-pine-ac7f.hiplitehehe.workers.dev/api/obfuscate', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: payload
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: payload,
     });
-
-    debug('Obfuscate API response status:', res.status);
-    const contentType = res.headers.get('content-type') || '';
-    const raw = await res.text();
-
-    debug('Obfuscate API content-type:', contentType);
-    debug('Obfuscate API raw response:', raw);
-
-    if (!res.ok) {
-      debug('Obfuscate API returned non-OK status');
-      return content;
-    }
-
-    let data;
-    try {
-      data = JSON.parse(raw);
-      debug('Parsed obfuscate API response:', JSON.stringify(data, null, 2));
-    } catch (e) {
-      debug('JSON parse error in obfuscate:', e.message);
-      return content;
-    }
-
-    if (!data.obfuscated) {
-      debug('Obfuscation missing in response. Returning original content.');
-    }
-
-    return data.obfuscated || content;
-
-  } catch (e) {
-    debug('obfuscate() caught error:', e.message);
+  } catch {
     return content;
   }
+
+  if (!res.ok) {
+    return content;
+  }
+
+  let data;
+  try {
+    data = await res.json();
+  } catch {
+    return content;
+  }
+
+  if (data.obfuscated && typeof data.obfuscated === 'string') {
+    return data.obfuscated;
+  }
+  return content;
 }
 
-async function storeNoteGithub(id, title, content, env, debug = () => {}) {
+/**
+ * storeNoteGithub(id, title, content, env)
+ * --------------------------------------
+ * Encodes `Title: {title}\n\n{content}` as base64 and PUTs it to:
+ *  https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/notes/{id}.txt
+ *
+ * Requires:
+ *  - env.REPO_OWNER
+ *  - env.REPO_NAME
+ *  - env.GITHUB_TOKEN
+ *  - (optional) env.BRANCH
+ */
+async function storeNoteGithub(id, title, content, env) {
   const path = `notes/${id}.txt`;
-  const body = `Title: ${title}\n\n${content}`;
-  const encoded = btoa(unescape(encodeURIComponent(body)));
+  const bodyText = `Title: ${title}\n\n${content}`;
+  // Cloudflare’s global btoa/atob exist
+  const encoded = btoa(bodyText);
 
-  debug(`Storing note to GitHub path: ${path}`);
-  const res = await fetch(`https://api.github.com/repos/${env.REPO_OWNER}/${env.REPO_NAME}/contents/${path}`, {
+  const putUrl = `https://api.github.com/repos/${env.REPO_OWNER}/${env.REPO_NAME}/contents/${path}`;
+  const payload = {
+    message: `Add note: ${id}`,
+    content: encoded,
+    branch: env.BRANCH || 'main',
+  };
+
+  const res = await fetch(putUrl, {
     method: 'PUT',
     headers: {
       Authorization: `token ${env.GITHUB_TOKEN}`,
       Accept: 'application/vnd.github.v3+json',
-      'User-Agent': 'MyNoteAppWorker/1.0'
+      'User-Agent': 'MyNoteAppCloudflareWorker/1.0',
     },
-    body: JSON.stringify({
-      message: `Add note: ${id}`,
-      content: encoded,
-      branch: env.BRANCH
-    })
+    body: JSON.stringify(payload),
   });
 
-  debug('GitHub API response status:', res.status);
   if (!res.ok) {
-    const errText = await res.text();
-    debug('GitHub API error response:', errText);
-    throw new Error('GitHub API error');
+    const text = await res.text();
+    throw new Error(`GitHub API error: ${res.status}\n${text}`);
   }
 }
 
+/**
+ * listNotesFromGithub(env)
+ * --------------------------------------
+ * Lists all *.txt files under `notes/` folder in the GitHub repo,
+ * fetches each file’s contents, and returns an array of objects:
+ *   [{ id, title, content, createdAt }, ... ]
+ *
+ * Note: `createdAt` is just set to now() because the original did likewise.
+ *       (If you prefer actual GitHub commit dates, you’d do an extra API call per file.)
+ */
 async function listNotesFromGithub(env) {
-  const res = await fetch(`https://api.github.com/repos/${env.REPO_OWNER}/${env.REPO_NAME}/contents/notes?ref=${env.BRANCH}`, {
+  const listUrl = `https://api.github.com/repos/${env.REPO_OWNER}/${env.REPO_NAME}/contents/notes?ref=${
+    env.BRANCH || 'main'
+  }`;
+
+  const res = await fetch(listUrl, {
     headers: {
       Authorization: `token ${env.GITHUB_TOKEN}`,
-      'User-Agent': 'MyNoteAppWorker/1.0'
-    }
+      'User-Agent': 'MyNoteAppCloudflareWorker/1.0',
+    },
   });
 
   if (!res.ok) {
-    throw new Error(`GitHub API error: ${await res.text()}`);
+    throw new Error(`GitHub API error: ${res.status}\n${await res.text()}`);
   }
 
   const files = await res.json();
   const notes = [];
 
+  // Expect `files` to be an array of { name, download_url, ... }
   for (const file of files) {
-    if (file.name.endsWith('.txt')) {
+    if (typeof file.name === 'string' && file.name.endsWith('.txt')) {
       const fileRes = await fetch(file.download_url);
+      if (!fileRes.ok) {
+        // Skip any single file that fails
+        continue;
+      }
       const raw = await fileRes.text();
-      const [titleLine, , ...rest] = raw.split('\n');
+      // Split at first blank line: line 0 is "Title: {…}", line 1 is blank, rest is content
+      const lines = raw.split('\n');
+      const titleLine = lines[0] || 'Title: Untitled';
       const title = titleLine.replace(/^Title:\s*/, '') || 'Untitled';
+      const content = lines.slice(2).join('\n');
+
       notes.push({
-        id: file.name.replace('.txt', ''),
+        id: file.name.replace(/\.txt$/, ''),
         title,
-        content: rest.join('\n'),
-        createdAt: new Date().toISOString()
+        content,
+        // The original Express code used `new Date().toISOString()` for createdAt;
+        // we do the same here.
+        createdAt: new Date().toISOString(),
       });
     }
   }
@@ -227,55 +359,68 @@ async function listNotesFromGithub(env) {
   return notes;
 }
 
-function renderHTML(notes, sortOrder = 'desc', debugLogs = []) {
-  const sorted = notes.sort((a, b) =>
-    sortOrder === 'desc'
-      ? new Date(b.createdAt) - new Date(a.createdAt)
-      : new Date(a.createdAt) - new Date(b.createdAt)
-  );
+/**
+ * renderHTML(notes, sortOrder)
+ * --------------------------------------
+ * Renders a simple HTML page containing:
+ *  - A form to POST /notes
+ *  - A list of existing notes (sorted by createdAt)
+ *  - A client-side <script> where `showNote(id)` simply does window.location.href
+ */
+function renderHTML(notes, sortOrder = 'desc') {
+  // Sort notes by createdAt
+  notes.sort((a, b) => {
+    const da = new Date(a.createdAt);
+    const db = new Date(b.createdAt);
+    return sortOrder === 'desc' ? db - da : da - db;
+  });
 
-  const list = sorted.map(note =>
-    `<div>
-      <strong>${note.title}</strong> (ID: ${note.id})
-      <a href="#" onclick="showNote('${note.id}'); return false;">View Content</a>
-    </div>`
-  ).join('');
+  // Build the list of <div>…</div> for each note
+  const listItems = notes
+    .map((note) => {
+      return `<div>
+        <strong>${escapeHtml(note.title)}</strong> (ID: ${note.id})
+        <a href="#" onclick="showNote('${note.id}'); return false;">View Content</a>
+      </div>`;
+    })
+    .join('');
 
-  const debugHtml = debugLogs.length
-    ? `<hr><h3>Debug logs:</h3><pre style="background:#eee; padding:10px; max-height:200px; overflow:auto;">${debugLogs.join('\n')}</pre>`
-    : '';
+  // The form, the list, and a small <script> to redirect
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Notes</title>
+</head>
+<body>
+  <form method="POST" action="/notes">
+    <input name="title" placeholder="Title" required /><br/>
+    <textarea name="content" rows="5" placeholder="Your content here…" required></textarea><br/>
+    <input type="password" name="password" placeholder="Password" required /><br/>
+    <button type="submit">Save</button>
+  </form>
+  <hr/>
+  ${listItems}
+  <script>
+    function showNote(id) {
+      // Redirect the browser to /notes/:id
+      window.location.href = '/notes/' + encodeURIComponent(id);
+    }
+  </script>
+</body>
+</html>`;
+}
 
-  return `
-    <!DOCTYPE html>
-    <html>
-    <head><title>Notes</title></head>
-    <body>
-      <form method="POST" action="/notes">
-        <input name="title" placeholder="Title" required><br>
-        <textarea name="content" rows="5" required></textarea><br>
-        <input type="password" name="password" placeholder="Password" required><br>
-        <button>Save</button>
-      </form>
-      <hr>
-      ${list}
-      ${debugHtml}
-
-      <script>
-        async function showNote(id) {
-          try {
-            const res = await fetch('/notes/' + id, {
-              headers: {
-                'User-Agent': 'Roblox'
-              }
-            });
-            if (!res.ok) throw new Error('Failed to fetch note: ' + res.status);
-            const text = await res.text();
-            alert('Note content:\\n\\n' + text);
-          } catch (err) {
-            alert('Error: ' + err.message);
-          }
-        }
-      </script>
-    </body>
-    </html>`;
+/**
+ * escapeHtml(str)
+ * --------------------------------------
+ * Simple helper to escape <>&"'
+ */
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }

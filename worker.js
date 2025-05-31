@@ -15,7 +15,7 @@ export default {
 
       if (req.method === 'GET' && pathname === '/') {
         debug('Handling GET /');
-        const notes = await listNotesFromGithub(env, debug);
+        const notes = await listNotesFromGithub(env); // debug removed here
         const html = renderHTML(notes, searchParams.get('sort') || 'desc', logs);
         return new Response(html, { headers: { 'Content-Type': 'text/html' } });
       }
@@ -65,7 +65,7 @@ export default {
           return new Response('Access denied', { status: 403 });
         }
 
-        const notes = await listNotesFromGithub(env, debug);
+        const notes = await listNotesFromGithub(env); // debug removed here
         const note = notes.find(n => n.id === id);
         if (!note) {
           debug('Note not found:', id);
@@ -119,11 +119,18 @@ async function filterText(text, debug = () => {}) {
 
 async function obfuscate(content, debug = () => {}) {
   try {
-    debug('Calling obfuscate API');
-    const res = await fetch('https://broken-pine-ac7f.hiplitehehe.workers.dev/api/obfuscate', {
+    debug('Calling obfuscate API with content:', content);
+
+    const payload = JSON.stringify({ script: content });
+    debug('Obfuscate API payload:', payload);
+
+    const url = 'https://broken-pine-ac7f.hiplitehehe.workers.dev/api/obfuscate';
+    debug('Obfuscate API URL:', url);
+
+    const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ script: content })
+      body: payload
     });
 
     debug('Obfuscate API response status:', res.status);
@@ -133,22 +140,28 @@ async function obfuscate(content, debug = () => {}) {
     debug('Obfuscate API content-type:', contentType);
     debug('Obfuscate API raw response:', raw);
 
+    if (!res.ok) {
+      debug('Obfuscate API returned non-OK status');
+      return content;
+    }
+
     let data;
     try {
       data = JSON.parse(raw);
-      debug('Parsed obfuscate response:', JSON.stringify(data, null, 2));
+      debug('Parsed obfuscate API response:', JSON.stringify(data, null, 2));
     } catch (e) {
       debug('JSON parse error in obfuscate:', e.message);
       return content;
     }
 
     if (!data.obfuscated) {
-      debug('No obfuscated content returned. Using original.');
+      debug('Obfuscation missing in response. Returning original content.');
     }
 
     return data.obfuscated || content;
+
   } catch (e) {
-    debug('obfuscate error:', e.message);
+    debug('obfuscate() caught error:', e.message);
     return content;
   }
 }
@@ -181,8 +194,7 @@ async function storeNoteGithub(id, title, content, env, debug = () => {}) {
   }
 }
 
-async function listNotesFromGithub(env, debug = () => {}) {
-  debug('Listing notes from GitHub...');
+async function listNotesFromGithub(env) {
   const res = await fetch(`https://api.github.com/repos/${env.REPO_OWNER}/${env.REPO_NAME}/contents/notes?ref=${env.BRANCH}`, {
     headers: {
       Authorization: `token ${env.GITHUB_TOKEN}`,
@@ -190,11 +202,8 @@ async function listNotesFromGithub(env, debug = () => {}) {
     }
   });
 
-  debug('GitHub API response status:', res.status);
   if (!res.ok) {
-    const errText = await res.text();
-    debug('GitHub API error response:', errText);
-    throw new Error('GitHub API error');
+    throw new Error(`GitHub API error: ${await res.text()}`);
   }
 
   const files = await res.json();
@@ -202,7 +211,6 @@ async function listNotesFromGithub(env, debug = () => {}) {
 
   for (const file of files) {
     if (file.name.endsWith('.txt')) {
-      debug('Fetching note file:', file.name);
       const fileRes = await fetch(file.download_url);
       const raw = await fileRes.text();
       const [titleLine, , ...rest] = raw.split('\n');
@@ -216,7 +224,6 @@ async function listNotesFromGithub(env, debug = () => {}) {
     }
   }
 
-  debug(`Loaded ${notes.length} notes`);
   return notes;
 }
 
@@ -230,7 +237,7 @@ function renderHTML(notes, sortOrder = 'desc', debugLogs = []) {
   const list = sorted.map(note =>
     `<div>
       <strong>${note.title}</strong> (ID: ${note.id})
-      <button onclick="showNote('${note.id}')">Show Content</button>
+      <a href="#" onclick="showNote('${note.id}'); return false;">View Content</a>
     </div>`
   ).join('');
 
@@ -258,7 +265,6 @@ function renderHTML(notes, sortOrder = 'desc', debugLogs = []) {
           try {
             const res = await fetch('/notes/' + id, {
               headers: {
-                // Spoof User-Agent to pass the Roblox check
                 'User-Agent': 'Roblox'
               }
             });

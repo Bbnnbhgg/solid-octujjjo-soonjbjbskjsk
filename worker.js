@@ -45,13 +45,9 @@ export default {
           debug('Filter failed, using raw inputs.', e.message);
         }
 
-        if (isRobloxScript(content)) {
-          debug('Detected Roblox script, obfuscating...');
-          content = await obfuscate(content, debug);
-          debug('Final obfuscated content:', content);
-        } else {
-          debug('Not a Roblox script, skipping obfuscation.');
-        }
+        debug('Obfuscating content...');
+        content = await obfuscate(content, debug);
+        debug('Final obfuscated content:', content);
 
         const id = crypto.randomUUID();
         debug('Generated note ID:', id);
